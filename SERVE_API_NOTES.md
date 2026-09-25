@@ -39,7 +39,7 @@ Base: `http://127.0.0.1:4097`. OpenAPI doc: `GET /doc` (auth required).
   `GET /experimental/tool/ids` (14 ids incl. bash/read/edit/write).
   WARNING: passing all-false breaks chat for mimo/ling/nemotron free models
   (instant empty reply, `finish` null). Gateway therefore leaves tools
-  ENABLED and sandboxes sessions in `./sandbox/` instead.
+  ENABLED and runs sessions in the detected project folder (sandbox fallback) instead.
 - Expect large `input` token counts (~20k): opencode prepends its agent
   system prompt. This counts against free-tier quota per request.
 

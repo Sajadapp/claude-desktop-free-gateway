@@ -43,18 +43,38 @@ import os
 import re
 import secrets
 import subprocess
+import threading
 import time
 import urllib.parse
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")  # .env overrides nothing; real env wins
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        val = int(os.getenv(name, str(default)))
+        return val if val > 0 else default
+    except Exception:
+        return default
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        val = float(os.getenv(name, str(default)))
+        return val if val > 0 else default
+    except Exception:
+        return default
+
 
 # ---------------- config (no secrets are ever logged) ----------------
 GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "local-dev-key-12345")
@@ -75,7 +95,28 @@ COMBO_PATH = os.getenv("COMBO_PATH", "combo.json")
 # isolated and never store real secrets in it.
 DISABLE_TOOLS = os.getenv("GATEWAY_DISABLE_TOOLS", "false").lower() == "true"
 SESSION_DIR = BASE_DIR / "sandbox"
-UPSTREAM_TIMEOUT = 300.0  # free models can take 30-90s
+UPSTREAM_TIMEOUT = 150.0  # per-model ceiling: free models answer in
+# ~5-35s when healthy; a hang beyond this is treated as failure so the
+# request falls back (or 502s) instead of stalling Claude Desktop for
+# many minutes per model.
+# Failure cooldown: a model that just failed is skipped for this long,
+# so one bad model doesn't cost a full timeout on EVERY turn while it
+# is down (free-tier flakiness comes in waves).
+try:
+    FAIL_COOLDOWN_S = int(os.getenv("GATEWAY_FAIL_COOLDOWN_S", "600"))
+    if FAIL_COOLDOWN_S <= 0:
+        FAIL_COOLDOWN_S = 600
+except Exception:
+    FAIL_COOLDOWN_S = 600
+# Wall-clock ceiling for ONE whole request (all combo models + the forced
+# retry). Without this an 8-model combo could burn 8 x UPSTREAM_TIMEOUT
+# and Claude Desktop would give up long before we answer.
+TOTAL_BUDGET_S = _float_env("GATEWAY_TOTAL_BUDGET_S", 600.0)
+_COOLDOWN_LOCK = threading.Lock()
+_MODEL_COOLDOWN: dict[str, float] = {}  # model_ref -> unix time of last failure
+# Inbound images live in sandbox/img for the duration of a request only.
+# This TTL (hours) bounds that dir so long sessions don't fill the disk.
+IMG_TTL_H = _float_env("GATEWAY_IMG_TTL_H", 6.0)
 GATEWAY_CAPTURE = os.getenv("GATEWAY_CAPTURE", "0") == "1"
 IMG_DIR = SESSION_DIR / "img"  # v3: saved inbound images for vision routing
 
@@ -129,22 +170,6 @@ def vision_rank() -> list[str]:
     return VISION_RANK_OVERRIDE or VISION_RANK
 
 
-def _int_env(name: str, default: int) -> int:
-    try:
-        val = int(os.getenv(name, str(default)))
-        return val if val > 0 else default
-    except Exception:
-        return default
-
-
-def _float_env(name: str, default: float) -> float:
-    try:
-        val = float(os.getenv(name, str(default)))
-        return val if val > 0 else default
-    except Exception:
-        return default
-
-
 MAX_IMAGES = _int_env("GATEWAY_MAX_IMAGES", 5)
 MAX_IMAGE_BYTES = int(_float_env("GATEWAY_MAX_IMAGE_MB", 4.0) * 1024 * 1024)
 
@@ -178,6 +203,18 @@ COMBO = load_combo()  # {alias: [model, ...]}, reloaded on restart
 
 
 # ---------------- opencode serve client ----------------
+def _new_client(**kw) -> httpx.Client:
+    """httpx client for the LOCAL serve only.
+
+    trust_env=False is deliberate and important: httpx reads HTTP(S)_PROXY /
+    NO_PROXY from the environment, and a NO_PROXY containing a bracketed IPv6
+    host (e.g. "::1,[::1]") makes httpx>=0.28 raise InvalidURL while building
+    the client - crashing the gateway before any request is sent. We only ever
+    talk to 127.0.0.1, so proxies are never wanted.
+    """
+    return httpx.Client(trust_env=False, **kw)
+
+
 def _basic_auth() -> str:
     raw = f"{OPENCODE_SERVE_USERNAME}:{OPENCODE_SERVE_PASSWORD}".encode()
     return "Basic " + base64.b64encode(raw).decode()
@@ -193,7 +230,7 @@ _serve_proc: subprocess.Popen | None = None
 def serve_probe(timeout: float = 5.0) -> tuple[bool, str]:
     """Return (reachable_with_valid_auth, detail). No secrets in detail."""
     try:
-        with httpx.Client(timeout=timeout) as c:
+        with _new_client(timeout=timeout) as c:
             r = c.get(OPENCODE_SERVE_URL + "/config", headers={"Authorization": _basic_auth()})
         if r.status_code == 200:
             return True, "ok"
@@ -284,6 +321,36 @@ class UpstreamError(Exception):
     pass
 
 
+# Longest useful transcript before we insist on a long-context model.
+# 150k chars ~ 40k tokens: beyond this the small free models start degrading.
+BIG_PROMPT_CHARS = _int_env("GATEWAY_BIG_PROMPT_CHARS", 150000)
+
+# Real context windows, read from the opencode serve /provider endpoint on
+# 2026-09-25 (free models cost 0; opencode-go is a PAID tier at $0.1/Mtok in).
+MODEL_CONTEXT: dict[str, int] = {
+    "opencode/mimo-v2.6-flash-free": 200_000,
+    "opencode/mimo-v2.5-free": 200_000,
+    "opencode/ling-3.0-flash-fin-free": 262_144,
+    "opencode/nemotron-3-ultra-free": 1_000_000,
+    "opencode/nemotron-3.5-lightning-free": 1_000_000,
+    "opencode/space-bunny-free": 1_048_576,
+    "opencode/muse-spark-1.2-contributor-free": 1_048_576,
+    "opencode/muse-spark-1.3-contributor-free": 1_048_576,
+    "opencode-go/muse-spark-1.3-contributor": 1_048_576,
+}
+
+
+def _model_context(ref: str) -> int:
+    """Context window for a model ref; 0 = unknown (never filtered out)."""
+    _, model_id = split_model(ref)
+    if model_id in MODEL_CONTEXT:
+        return MODEL_CONTEXT[model_id]
+    for known, ctx in MODEL_CONTEXT.items():
+        if known.split("/", 1)[-1] == model_id:
+            return ctx
+    return 0
+
+
 def split_model(ref: str) -> tuple[str, str]:
     """'opencode/mimo-v2.6-flash-free' -> ('opencode', 'mimo-v2.6-flash-free')."""
     if "/" in ref:
@@ -292,21 +359,53 @@ def split_model(ref: str) -> tuple[str, str]:
     return "opencode", ref
 
 
+def resolve_session_dir(project_paths: list[str] | None) -> Path:
+    """Where the model actually RUNS for this request.
+
+    This is the root fix for "the model says it entered my folder but never
+    did". Claude Desktop tells us the opened folder in the system prompt
+    ("Working directory: ..."), but the gateway used to hardcode its own
+    sandbox as the serve session directory. The model was therefore told to
+    read the user's project while every tool call executed inside the sandbox
+    - so it "read" sandbox files, reported nonsense, and looped.
+
+    Now the session runs in the folder the user actually opened, so relative
+    paths (Read("main.py"), Glob("*")) resolve against their project and the
+    model genuinely has read/write access there - like real Claude Code.
+
+    Falls back to the sandbox when the folder is missing or not a directory,
+    so a stale/renamed path can never break the request.
+    """
+    for p in (project_paths or []):
+        try:
+            cand = Path(p)
+            if cand.is_dir():
+                return cand
+        except Exception:
+            continue
+    return SESSION_DIR
+
+
 def chat_via_serve(client: httpx.Client, model_ref: str, system: str, prompt: str,
-                   image_paths: list[dict] | None = None) -> tuple[str, dict]:
+                   image_paths: list[dict] | None = None,
+                   work_dir: Path | None = None) -> tuple[str, dict]:
     """One attempt with a single free model. Returns (text, usage). Raises UpstreamError.
 
     image_paths: [{"path", "mime"}] attached as serve file parts
     ({"type": "file", "mime": ..., "url": "file://..."}). A 400/422 on an
     image request means the model rejected the format -> UpstreamError so
     chat_with_fallback moves on (never aborts the whole request).
+
+    work_dir: the user's opened project folder, so the model runs THERE.
+    Defaults to the isolated sandbox.
     """
     provider_id, model_id = split_model(model_ref)
-    # 1. fresh stateless session, isolated in the gateway dir
+    session_dir = work_dir or SESSION_DIR
+    # 1. fresh stateless session, in the user's project folder when known
     try:
         r = client.post(
             OPENCODE_SERVE_URL + "/session",
-            params={"directory": str(SESSION_DIR)},
+            params={"directory": str(session_dir)},
             json={"title": "gateway chat"},
             headers=serve_headers(),
         )
@@ -363,14 +462,45 @@ def chat_via_serve(client: httpx.Client, model_ref: str, system: str, prompt: st
     return text, usage
 
 
+def _prune_cooldown(now: float) -> None:
+    """Drop cooldown entries whose window has fully elapsed (bounded dict)."""
+    with _COOLDOWN_LOCK:
+        stale = [ref for ref, ts in _MODEL_COOLDOWN.items()
+                 if now - ts >= FAIL_COOLDOWN_S]
+        for ref in stale:
+            _MODEL_COOLDOWN.pop(ref, None)
+
+
+def _cooldown_active(ref: str, now: float) -> bool:
+    with _COOLDOWN_LOCK:
+        ts = _MODEL_COOLDOWN.get(ref)
+    return ts is not None and now - ts < FAIL_COOLDOWN_S
+
+
+def _cooldown_mark_failed(ref: str, now: float) -> None:
+    with _COOLDOWN_LOCK:
+        _MODEL_COOLDOWN[ref] = now
+
+
+def _cooldown_clear(ref: str) -> None:
+    with _COOLDOWN_LOCK:
+        _MODEL_COOLDOWN.pop(ref, None)
+
+
 def chat_with_fallback(client: httpx.Client, alias: str, system: str, prompt: str,
-                       image_paths: list[dict] | None = None) -> tuple[str, str, dict]:
+                       image_paths: list[dict] | None = None,
+                       deadline: float | None = None,
+                       work_dir: Path | None = None) -> tuple[str, str, dict]:
     """Try each combo model in order. Returns (text, model_used, usage).
 
     Vision routing (v3): when image_paths is non-empty, vision-PASS models
     (VISION_RANK filtered to this alias) are tried FIRST with images
     attached, then the remaining combo models as text-only fallback (with an
     omission note appended). Without images the existing order is untouched.
+
+    deadline: absolute time.time() after which no further model is tried
+    (the whole-request budget). Prevents a long combo from stacking one
+    UPSTREAM_TIMEOUT per model.
     """
     models = COMBO.get(alias, [])
     if not models:
@@ -382,32 +512,69 @@ def chat_with_fallback(client: httpx.Client, alias: str, system: str, prompt: st
         ordered = [(m, True) for m in rank] + [(m, False) for m in rest]
         if rank:
             log.info("vision: %d images -> vision-first order %s",
-                     len(image_paths), [m.split("/", 1)[-1] for m in rank])
+                     len(image_paths), rank)
         else:
             log.info("vision: %d images but no vision model in alias '%s'; text-only",
                      len(image_paths), alias)
     else:
         ordered = [(m, False) for m in models]
+    # Volume routing: a long transcript needs a model with a long context.
+    # The free mimo model only holds ~200k tokens; sending it a 400k-char
+    # prompt (~100k tokens) is fine, but going far past that is not, so big
+    # prompts prefer the 1M-context free models and only fall back to the
+    # paid opencode-go entry when the user picked it explicitly.
+    if len(prompt) >= BIG_PROMPT_CHARS:
+        big = [x for x in ordered if _model_context(x[0]) >= 900_000]
+        if big and big != ordered:
+            log.info("routing: %d-char prompt -> long-context models %s",
+                     len(prompt), [m for m, _ in big])
+            ordered = big
+    # Failure cooldown: skip models that failed recently (they tend to
+    # stay down in waves); if everything is cooled, try all anyway.
+    now = time.time()
+    _prune_cooldown(now)
+    fresh = [(ref, attach) for ref, attach in ordered
+             if not _cooldown_active(ref, now)]
+    fresh_refs = {ref for ref, _ in fresh}
+    skipped = [ref for ref, _ in ordered if ref not in fresh_refs]
+    if skipped:
+        log.info("cooldown: skipping recently-failed %s", skipped)
+    if fresh:
+        ordered = fresh
+    else:
+        log.info("cooldown: all models cooled, trying anyway")
     last_err = "no models configured"
     for idx, (ref, attach) in enumerate(ordered):
+        # Whole-request budget: never start a model we have no time for.
+        if deadline is not None and time.time() >= deadline:
+            last_err = f"request time budget ({TOTAL_BUDGET_S:.0f}s) exhausted"
+            log.info("fallback: %s (after %d model(s))", last_err, idx)
+            break
         try:
             eff_prompt = prompt
             if image_paths and not attach:
-                eff_prompt = (prompt + f"\n\n[{len(image_paths)} image(s) referenced "
-                                       f"above omitted: text-only fallback, no vision.]")
+                # NOTE: no count here - flatten_messages already emitted a
+                # marker for every omitted image, and the omitted total is
+                # also passed separately to the decision prompt. Repeating
+                # the number made the model double-count the omissions.
+                eff_prompt = (prompt + "\n\n[The image(s) referenced above are NOT "
+                                       "visible to you in this text-only fallback.]")
             if attach:
                 log.info("vision: %d images -> trying %s (vision-rank #%d)",
                          len(image_paths), ref, idx + 1)
             text, usage = chat_via_serve(client, ref, system, eff_prompt,
-                                         image_paths if attach else None)
+                                         image_paths if attach else None,
+                                         work_dir=work_dir)
             if image_paths:
                 log.info("vision: alias %s answered via %s (%d chars, images=%s)",
                          alias, ref, len(text), "attached" if attach else "omitted")
             else:
                 log.info("alias %s answered via %s (%d chars)", alias, ref, len(text))
+            _cooldown_clear(ref)  # healthy again: clear cooldown
             return text, ref, usage
         except UpstreamError as e:
             last_err = f"{ref}: {e}"
+            _cooldown_mark_failed(ref, time.time())  # cool down this model
             log.info("fallback: %s", last_err[:200])
             continue
     raise UpstreamError(f"all {len(ordered)} combo models failed; last: {last_err[:300]}")
@@ -513,6 +680,35 @@ def _ext_for(raw: bytes, mime: str) -> str | None:
     return None
 
 
+def cleanup_images(max_age_s: float | None = None) -> int:
+    """Delete saved inbound images older than the TTL. Returns files removed.
+
+    sandbox/img accumulates one file per inbound image; without this a long
+    Cowork session would grow the dir (and the disk) without bound. Called
+    on startup and after each vision request. Safe to call concurrently.
+    """
+    ttl = IMG_TTL_H * 3600.0 if max_age_s is None else max_age_s
+    if ttl <= 0:
+        return 0
+    removed = 0
+    cutoff = time.time() - ttl
+    try:
+        entries = list(IMG_DIR.glob("*"))
+    except Exception:
+        return 0
+    for p in entries:
+        try:
+            if p.is_file() and p.stat().st_mtime < cutoff:
+                p.unlink()
+                removed += 1
+        except Exception:
+            continue  # file in use / already gone: skip, never fail a request
+    if removed:
+        log.info("vision: pruned %d image(s) older than %.1fh",
+                 removed, ttl / 3600.0)
+    return removed
+
+
 def extract_request_images(messages: list) -> tuple[list[dict], int, int, list[str]]:
     """Decode/save inbound images. Returns (files, omitted, invalid, status).
 
@@ -565,6 +761,21 @@ def extract_request_images(messages: list) -> tuple[list[dict], int, int, list[s
 def _serve_file_url(abs_path: str) -> str:
     # Verified form (2026-09-24): "file://" + forward-slash abs path.
     return "file://" + abs_path.replace("\\", "/")
+
+
+# ---- per-turn render limits ------------------------------------------------
+# These used to be hard-coded at 2000/500 chars, which silently threw away most
+# of every tool result and made the model re-read files to recover the content.
+# They are raised (still far below any model's real context window) and are
+# tunable without a code edit.
+TOOL_RESULT_CHAR_LIMIT = _int_env("GATEWAY_TOOL_RESULT_CHARS", 8000)
+TOOL_INPUT_CHAR_LIMIT = _int_env("GATEWAY_TOOL_INPUT_CHARS", 1500)
+# Kill switch for the "files you already read" ledger, in case a model ever
+# misreads it as a constraint.
+PROGRESS_LEDGER = os.getenv("GATEWAY_PROGRESS_LEDGER", "true").lower() != "false"
+# Log which project folder the gateway resolved, every request. This is the
+# first thing to check when the agent opens the wrong folder.
+PROJECT_LOG = os.getenv("GATEWAY_PROJECT_LOG", "true").lower() != "false"
 
 
 def flatten_messages(messages: list,
@@ -634,15 +845,15 @@ def flatten_messages(messages: list,
                                 else:
                                     nested_marks.append(_image_marker())
                     tid = b.get("tool_use_id") or "tool"
-                    txt_result = _tool_result_text(b.get("content"))[:2000]
+                    txt_result = _tool_result_text(b.get("content"))[:TOOL_RESULT_CHAR_LIMIT]
                     chunks.append(f"ToolResult({tid}): {txt_result}")
                     chunks.extend(nested_marks)
                 elif btype == "tool_use":
                     name = b.get("name") or "tool"
                     try:
-                        inp = json.dumps(b.get("input", {}), ensure_ascii=False)[:500]
+                        inp = json.dumps(b.get("input", {}), ensure_ascii=False)[:TOOL_INPUT_CHAR_LIMIT]
                     except Exception:
-                        inp = str(b.get("input", ""))[:500]
+                        inp = str(b.get("input", ""))[:TOOL_INPUT_CHAR_LIMIT]
                     chunks.append(f"ToolCall({name}): {inp}")
             txt = "\n".join(chunks)
         else:
@@ -702,9 +913,318 @@ def _catalog_line(tool: dict) -> str:
     return f"- {name}: {desc}. Input schema: any object"
 
 
+READ_ONLY_HINTS = ("read", "glob", "grep", "list", "find", "search", "fetch",
+                   "ls", "tree", "view", "inspect", "open")
+# Bookkeeping tools: they neither change the project nor count as exploration.
+# They must NOT reset the read-only streak - a single TaskUpdate in the middle
+# of a long explore used to reset the counter and hide the stall completely.
+NEUTRAL_HINTS = ("taskupdate", "taskcreate", "todoread", "todowrite", "tasklist",
+                 "listtasks", "exitplanmode", "exit_plan", "exitplan",
+                 "askuserquestion", "websearch", "webfetch", "reportfindings")
+# Real mutations: any of these means the agent is making progress.
+MUTATING_HINTS = ("edit", "write", "notebookedit", "bash", "str_replace", "strreplace",
+                  "apply_patch", "applypatch", "multiedit", "create", "delete",
+                  "remove", "move", "rename", "mkdir", "save", "patch")
+LOOP_REPEAT_THRESHOLD = 3  # same exact tool call this many times => loop
+READ_ONLY_STREAK_THRESHOLD = 8  # this many read-only calls in a row => stall
+# Distinct-file exploration stall: many reads, no mutation anywhere in the
+# window. Catches the "read 14 different files and never act" spiral, which
+# the exact-repeat and streak checks both miss.
+EXPLORE_STALL_THRESHOLD = 6
+LOOP_WINDOW = 12
+
+
+def _canonical_tool_input(inp) -> str:
+    try:
+        return json.dumps(inp, ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":"))[:500]
+    except Exception:
+        return str(inp)[:500]
+
+
+def detect_tool_loop(messages: list) -> tuple[list[tuple[str, int]], int]:
+    """Scan assistant tool_use blocks in the request history.
+
+    Returns (repeated, read_only_streak): repeated is [(desc, count)]
+    for exact tool calls (name + canonical input) seen >= threshold;
+    read_only_streak is the trailing run of read-only calls.
+    Stateless: everything comes from the history in this request.
+
+    Only the last LOOP_WINDOW calls are examined: a repeat that happened
+    20 turns ago is normal agent behaviour, not a loop.
+    """
+def _tool_kind(name: str) -> str:
+    """'read' | 'mutate' | 'neutral' for a tool name (substring match, lowercase)."""
+    low = name.lower()
+    if any(h in low for h in MUTATING_HINTS):
+        return "mutate"
+    if any(h in low for h in READ_ONLY_HINTS):
+        return "read"
+    if any(h in low for h in NEUTRAL_HINTS):
+        return "neutral"
+    return "other"
+
+
+def detect_tool_loop(messages: list) -> tuple[list[tuple[str, int]], int, int]:
+    """Scan assistant tool_use blocks in the request history.
+
+    Returns (repeated, read_only_streak, explore_stall):
+      repeated       - [(desc, count)] for exact repeated calls (name+input)
+      read_only_streak - trailing run of read-only calls; neutral bookkeeping
+                         tools (TaskUpdate/TodoWrite/...) do NOT break it
+      explore_stall  - how many read-only calls happened in the recent window
+                         with no mutating call at all
+
+    Only the last LOOP_WINDOW calls are examined: a repeat from 20 turns ago is
+    normal agent behaviour, not a loop.
+    """
+    uses: list[tuple[str, str]] = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content", "")
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if (isinstance(b, dict) and b.get("type") == "tool_use"
+                    and isinstance(b.get("name"), str)):
+                inp = b.get("input", {})
+                uses.append((b["name"],
+                             _canonical_tool_input(inp if isinstance(inp, dict) else {})))
+    window = uses[-LOOP_WINDOW:] if len(uses) > LOOP_WINDOW else uses
+    counts: dict[tuple[str, str], int] = {}
+    for key in window:
+        counts[key] = counts.get(key, 0) + 1
+    # Stable order: most frequent first, so the prompt shows the worst offender.
+    repeated = sorted(([f"{name} {inp}", c] for (name, inp), c in counts.items()
+                       if c >= LOOP_REPEAT_THRESHOLD), key=lambda x: -x[1])
+    # Trailing read-only run. A neutral call (task bookkeeping) is skipped, not
+    # treated as a break - otherwise one TaskUpdate hides a 20-call explore.
+    streak = 0
+    for name, _ in reversed(window):
+        kind = _tool_kind(name)
+        if kind == "read":
+            streak += 1
+        elif kind == "neutral":
+            continue
+        else:
+            break
+    # Window-wide stall: lots of reading, zero writing.
+    kinds = [_tool_kind(n) for n, _ in window]
+    read_total = sum(1 for k in kinds if k == "read")
+    mutate_total = sum(1 for k in kinds if k == "mutate")
+    explore_stall = read_total if mutate_total == 0 else 0
+    return repeated, streak, explore_stall
+
+
+_PATH_RE = re.compile(r"(?:^|[\s\"'(<])((?:[A-Za-z]:[\\/]|\\\\)[^\s\"'`<>|*?]{2,200})")
+# Claude Desktop puts the attached project folder in the SYSTEM prompt as
+# "Working directory: <path>" (inside an <env> block). It is NOT in the
+# messages, which is why the model kept asking for a folder the user had
+# already attached. We parse it out and treat it as the authoritative project.
+_CWD_RE = re.compile(
+    r"(?:working\s+directory|current\s+directory|project\s+(?:root|folder|directory)|"
+    r"workspace\s+(?:root|folder|path)|cwd|folder|dossier|repertoire)"
+    r"\s*[:=]\s*[\"']?((?:[A-Za-z]:[\\/]|\\\\)[^\"'\r\n<>]{1,200})",
+    re.IGNORECASE)
+# Same idea, but for a path that was pasted as a document/attachment header.
+_ATTACH_RE = re.compile(
+    r"(?:attached|attachment|folder|project|paste[ds]?|file)\s*[:=]\s*"
+    r"[\"']?((?:[A-Za-z]:[\\/]|\\\\)[^\"'\r\n<>]{1,200})",
+    re.IGNORECASE)
+
+
+def discover_cwd_paths(system: str | list | None) -> list[str]:
+    """Project folders the CLIENT already told us about, in priority order.
+
+    This is the fix for "I attached the folder, why is it asking me again?":
+    Claude Desktop announces the working directory in the system prompt, and we
+    were dropping it on the floor. The result is authoritative - it beats any
+    path the model might guess.
+    """
+    text = extract_system(system) if not isinstance(system, str) else system
+    if not text:
+        return []
+    out: list[str] = []
+    for rx in (_CWD_RE, _ATTACH_RE):
+        for m in rx.finditer(text):
+            p = m.group(1).strip().rstrip(".,;:)]}'\"")
+            if SESSION_DIR.name.lower() in p.lower():
+                continue  # our own sandbox is never the user's project
+            if p.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+                continue
+            if p not in out:
+                out.append(p)
+        if out:
+            break  # the explicit "working directory" wins over looser matches
+    return out
+
+
+def discover_project_paths(messages: list) -> list[str]:
+    """Extract real Windows/UNC project paths the user actually mentioned.
+
+    The model kept asking for a path it had ALREADY been given, then wandered
+    into an unrelated sibling folder. It cannot tell a project path from a
+    stray token inside a tool_result, so we do the extraction here and state
+    the facts explicitly.
+    """
+    found: list[str] = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content", "")
+        texts: list[str] = []
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "text" and isinstance(b.get("text"), str):
+                    texts.append(b["text"])
+                elif b.get("type") == "tool_use":
+                    name = str(b.get("name", ""))
+                    if name.lower() in ("read", "write", "edit", "notebookedit", "glob", "grep"):
+                        v = b.get("input", {})
+                        if isinstance(v, dict):
+                            for key in ("file_path", "path", "notebook_path", "pattern"):
+                                if isinstance(v.get(key), str):
+                                    texts.append(v[key])
+                elif b.get("type") == "tool_result":
+                    c = b.get("content")
+                    if isinstance(c, str):
+                        texts.append(c[:400])
+        for t in texts:
+            for match in _PATH_RE.finditer(t):
+                p = match.group(1).rstrip(".,;:)]}'\"")
+                # Skip our own sandbox and image files: they are not the project.
+                if SESSION_DIR.name.lower() in p.lower():
+                    continue
+                if p.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+                    continue
+                if p not in found:
+                    found.append(p)
+    return found
+
+
+def summarize_progress(messages: list) -> tuple[list[str], list[str], int]:
+    """Extract what the agent ALREADY did, so it stops re-reading the same files.
+
+    The model kept re-reading files it had already opened because the flat
+    transcript never says "you already read this one". Free small models have
+    no other memory: this summary is their only record of past actions.
+
+    Returns (read_entries, written_entries, n_turns) where read_entries are
+    "path (first N lines)" strings for Read/Glob/Grep calls.
+    """
+    reads: list[str] = []
+    writes: list[str] = []
+    seen_read: set[str] = set()
+    seen_write: set[str] = set()
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content", "")
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if not isinstance(b, dict) or b.get("type") != "tool_use":
+                continue
+            name = str(b.get("name", ""))
+            inp = b.get("input", {})
+            if not isinstance(inp, dict):
+                continue
+            path = (inp.get("file_path") or inp.get("notebook_path")
+                    or inp.get("path") or "")
+            if _tool_kind(name) == "read" and path and path not in seen_read:
+                seen_read.add(path)
+                reads.append(str(path))
+            elif _tool_kind(name) == "mutate" and path and path not in seen_write:
+                seen_write.add(path)
+                writes.append(str(path))
+    return reads, writes, len(reads)
+
+
+def _progress_note(reads: list[str], writes: list[str]) -> str:
+    """Render the already-done ledger the model can act on."""
+    if not reads and not writes:
+        return ""
+    lines = ["Progress so far (from THIS conversation - do not repeat any of it):"]
+    if reads:
+        lines.append(f"  You already READ these {len(reads)} path(s) - do NOT read them again:")
+        for p in reads[:25]:
+            lines.append(f"    - {p}")
+        if len(reads) > 25:
+            lines.append(f"    ... and {len(reads) - 25} more")
+    if writes:
+        lines.append(f"  You already MODIFIED these {len(writes)} path(s) - they are done:")
+        for p in writes[:15]:
+            lines.append(f"    - {p}")
+    return "\n".join(lines)
+
+
+def _workspace_note(paths: list[str] | None = None) -> str:
+    """Tell the model exactly where the project is and what it contains.
+
+    Claude Desktop sends the whole conversation, but without grounding the
+    model wanders into whatever folder it guesses, reports "it's empty"
+    about an unrelated path, and invents a replacement file.
+    """
+    lines = [
+        "Workspace facts (these are TRUE - do not re-discover them, do not guess):",
+    ]
+    wd = resolve_session_dir(paths)
+    if paths and wd != SESSION_DIR:
+        lines.append(
+            f"- You are CURRENTLY WORKING INSIDE the user's project folder: {wd}. "
+            f"That is your working directory for this whole task - relative paths "
+            f"like \"main.py\" or \"src/app.py\" resolve there automatically.")
+        lines.append(
+            "- You ALREADY have read AND write access to that folder (same as a "
+            "normal coding agent). Read, Edit, Write and run commands there "
+            "directly. Do NOT claim you cannot access it and do NOT ask the user "
+            "for the path - you are in it.")
+    else:
+        lines.append(
+            f"- Your working directory is {SESSION_DIR} (a scratch sandbox), NOT "
+            f"the user's project. {SESSION_DIR.name}/img/ holds only screenshots.")
+    paths = paths or []
+    if paths:
+        lines.append(
+            "- THE project folder for this task - the user already opened it in "
+            "Claude Desktop. Use this exact path:")
+        for p in paths[:5]:
+            lines.append(f"    * {p}")
+        lines.append(
+            "- That folder is the ONLY scope. If any other path shows up in this "
+            "conversation (a file read earlier, a folder merely mentioned, a sibling "
+            "project), it is NOT the task: do not open it, do not treat it as the "
+            "project, do not switch to it. Two paths here means one is stale "
+            "context - keep using the folder listed above.")
+        lines.append(
+            "- To see what is inside, just Read/Glob there - you DO have access. "
+            "Never ask the user for the path and never say you cannot find it.")
+        lines.append(
+            "- Read the project's real entry point first (the file the user named, "
+            "or the main module that imports the rest). Style/design changes go "
+            "in the EXISTING files - do NOT create a new .html or a parallel copy "
+            "just because it is easier.")
+    else:
+        lines.append(
+            "- The user has NOT given you a project path yet. If you need one, ASK "
+            "for it in one short sentence. Never invent a path.")
+    return "\n".join(lines)
+
+
 def build_tool_decision_prompt(tools: list, tool_choice, transcript: str,
                                system_text: str, images_omitted: int,
-                               max_tokens, images_attached: bool = False) -> str:
+                               max_tokens, images_attached: bool = False,
+                               loop_repeats: list | None = None,
+                               read_only_streak: int = 0,
+                               explore_stall: int = 0,
+                               project_paths: list | None = None,
+                               done_reads: list | None = None,
+                               done_writes: list | None = None) -> str:
     if isinstance(max_tokens, bool):
         budget = 2000
     elif isinstance(max_tokens, int):
@@ -722,7 +1242,14 @@ def build_tool_decision_prompt(tools: list, tool_choice, transcript: str,
         choice_line = "Answer with text only. Do not call tools."
     catalog = "\n".join(_catalog_line(t) for t in tools if isinstance(t, dict))
     parts = [TOOL_DECISION_ROLE, "", "Available tools:", catalog, "", choice_line, "",
-             "Conversation:"]
+             _workspace_note(project_paths), ""]
+    # The already-done ledger goes BEFORE the conversation: the flat transcript
+    # makes old reads look like fresh work, and this is the only thing that
+    # tells the model which files it has already opened.
+    ledger = _progress_note(done_reads or [], done_writes or []) if PROGRESS_LEDGER else ""
+    if ledger:
+        parts += [ledger, ""]
+    parts.append("Conversation:")
     if images_attached:
         parts.append("Screenshots are attached inline; use them for coordinates/grounding.")
         if images_omitted > 0:
@@ -735,6 +1262,26 @@ def build_tool_decision_prompt(tools: list, tool_choice, transcript: str,
             f"{images_omitted} image block(s) were omitted. "
             f"Act conservatively for coordinate/grounding tasks.")
     parts.append(transcript if transcript else "(no conversation content)")
+    if loop_repeats:
+        shown = "; ".join(f"{desc} (x{c})" for desc, c in loop_repeats[:3])
+        parts += ["",
+                  f"LOOP WARNING: you already made these exact calls repeatedly: {shown}. "
+                  f"Do NOT call them again. Take a DIFFERENT concrete action now "
+                  f"(Edit/Write/Bash to change code, or write the final summary). "
+                  f"Repeating an already-made call is forbidden."]
+    if read_only_streak >= READ_ONLY_STREAK_THRESHOLD:
+        parts += ["",
+                  f"PROGRESS WARNING: your last {read_only_streak} tool calls were "
+                  f"all read-only exploration. Stop exploring. Make the pending code "
+                  f"change now, or summarize what is blocking you and what you need."]
+    if explore_stall >= EXPLORE_STALL_THRESHOLD:
+        parts += ["",
+                  f"STOP EXPLORING: {explore_stall} of your last {min(len(tools) + explore_stall, LOOP_WINDOW)} "
+                  f"tool calls only READ files - not one of them changed anything. "
+                  f"You already know enough. Do NOT read, glob, grep or list anything else. "
+                  f"This turn you MUST either (a) make the actual edit with Edit/Write, "
+                  f"or (b) reply with a final text summary of what you found. "
+                  f"Answering 'I will continue' and reading more files is forbidden."]
     if system_text:
         parts += ["", "System:", system_text]
     parts += ["", ("Keep text parts concise. Ensure every tool_use input is a JSON object "
@@ -753,8 +1300,11 @@ def _strip_markdown_fences(s: str) -> str:
     return "\n".join(lines).strip()
 
 
-_DRIVE_TOKEN_RE = re.compile(r"[A-Za-z]:(?:\\[^\s\"'`{}\[\](),;]+)+")
-_SINGLE_BACKSLASH_RE = re.compile(r"(?<!\\)\\(?!\\)")
+_DRIVE_TOKEN_RE = re.compile(r"[A-Za-z]:(?:\\[^\s\"'`{}\\[\](),;]+)+")
+# Double ONLY bare single backslashes (path separators like \A or \f).
+# Never touch backslashes already escaping a quote/backslash (\" \\ \')
+# — doubling those corrupts the JSON further.
+_SINGLE_BACKSLASH_RE = re.compile(r"(?<!\\)\\(?![\"'\\])")
 _BAD_ESCAPE_RE = re.compile(r"(?<!\\)\\(?![\"\\/bfnrtu])")
 
 
@@ -876,6 +1426,41 @@ def _validate_decision_items(data: dict, valid_names: set[str]) -> list[dict] | 
     if not kept:
         return None
     return kept
+
+
+def _salvage_truncated_decision(raw: str, valid_names: set[str]) -> list[dict] | None:
+    """Last resort for outputs cut off mid-JSON (e.g. max_tokens hit).
+
+    Tries closing the truncated tail with a few suffixes and keeps the
+    first result that parses AND contains at least one known tool_use.
+    Returns None when nothing salvageable is found (caller falls back
+    to plain text).
+    """
+    base = raw.rstrip()
+    # A dangling trailing backslash would escape our closing quote.
+    while len(base) >= 2 and base.endswith("\\") and not base.endswith("\\\\"):
+        base = base[:-1]
+    # Also try dropping an incomplete trailing fragment: rewind to the
+    # last few complete-item boundaries so a cut mid-key/mid-string in
+    # the LAST tool call still salvages the earlier complete calls.
+    starts = [base]
+    idx = len(base)
+    for _ in range(3):
+        idx = base.rfind("},", 0, idx - 1)
+        if idx < 0:
+            break
+        starts.append(base[:idx + 1])
+    suffixes = ('', '"', '}', ']}', '"]}', '"}', '"}]}', '"}}]}',
+                '}]}', '}}]}')
+    for start in starts:
+        for suffix in suffixes:
+            data = _lenient_json_loads(start + suffix)
+            if not isinstance(data, dict):
+                continue
+            items = _validate_decision_items(data, valid_names)
+            if items and any(i["type"] == "tool_use" for i in items):
+                return items
+    return None
 
 
 def _assign_tool_ids(items: list[dict]) -> list[dict]:
@@ -1065,19 +1650,117 @@ def anthropic_sse(text: str, alias: str, msg_id: str, usage: dict) -> StreamingR
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+# ---------------- blocking workers (run in a threadpool, never on the loop) --
+# Every upstream call is synchronous (httpx.Client + blocking reads). Running
+# it directly inside an `async def` endpoint blocks the whole event loop, so
+# /health stops answering and concurrent requests serialise behind one slow
+# model. These helpers are pure-sync and are dispatched with run_in_threadpool.
+def _chat_worker(alias: str, system: str, prompt: str,
+                 img_files: list[dict] | None, deadline: float,
+                 work_dir: Path | None = None) -> tuple[str, str, dict]:
+    with _new_client(timeout=UPSTREAM_TIMEOUT) as client:
+        return chat_with_fallback(client, alias, system, prompt,
+                                  image_paths=img_files or None, deadline=deadline,
+                                  work_dir=work_dir)
+
+
+def _decision_worker(alias: str, decision_prompt: str, retry_prompt: str | None,
+                     img_files: list[dict] | None, valid_names: set[str],
+                     forced_name: str | None, deadline: float,
+                     work_dir: Path | None = None
+                     ) -> tuple[str, str, dict, list[dict]]:
+    """Run the tool-bridge decision (and optional forced retry) off-loop.
+
+    Returns (raw, used_model, usage, items). items is already salvaged or
+    text-wrapped, so the caller only has to assign ids and respond.
+    """
+    with _new_client(timeout=UPSTREAM_TIMEOUT) as client:
+        raw, used_model, usage = chat_with_fallback(
+            client, alias, "", decision_prompt,
+            image_paths=img_files or None, deadline=deadline, work_dir=work_dir)
+        data = _extract_decision_json(raw)
+        items = _validate_decision_items(data, valid_names) if data is not None else None
+        tool_names = [i["name"] for i in items if i["type"] == "tool_use"] if items else []
+        # Forced-tool second attempt with a stronger forcing line. Skipped
+        # when the budget is already spent (it would just burn the deadline).
+        if retry_prompt and forced_name and forced_name not in tool_names:
+            if deadline is not None and time.time() >= deadline:
+                log.info("forced retry skipped: time budget exhausted")
+                retry_prompt = None
+        if retry_prompt and forced_name:
+            log.info("forced tool '%s' absent in first decision; retrying with stronger force",
+                     forced_name[:80])
+            try:
+                raw2, used_model2, usage2 = chat_with_fallback(
+                    client, alias, "", retry_prompt,
+                    image_paths=img_files or None, deadline=deadline,
+                    work_dir=work_dir)
+                data2 = _extract_decision_json(raw2)
+                items2 = (_validate_decision_items(data2, valid_names)
+                          if data2 is not None else None)
+                tool_names2 = [i["name"] for i in items2
+                               if i["type"] == "tool_use"] if items2 else []
+                if items2 is not None and forced_name in tool_names2:
+                    raw, used_model, usage = raw2, used_model2, usage2
+                    items, tool_names = items2, tool_names2
+                else:
+                    log.info("forced tool '%s' still absent; text fallback (never 502)",
+                             forced_name[:80])
+                    items = [{"type": "text", "text": raw2[:4000]}]
+            except UpstreamError as e2:
+                # Retry failed but first attempt may still be usable.
+                log.info("forced retry upstream failed (%s); using first attempt",
+                         str(e2)[:120])
+        if items is None:
+            salvaged = _salvage_truncated_decision(raw, valid_names)
+            if salvaged is not None:
+                log.info("salvaged truncated tool decision (%d tool_use) via %s",
+                         sum(1 for i in salvaged if i["type"] == "tool_use"),
+                         used_model)
+                items = salvaged
+            else:
+                full = raw.encode("unicode_escape").decode("ascii", "replace")
+                log.info("tool-decision parse failed (%d chars, model %s): %s",
+                         len(raw), used_model, full[:8000])
+                items = [{"type": "text", "text": raw[:4000]}]
+    return raw, used_model, usage, items
+
+
 # ---------------- app ----------------
-app = FastAPI(title="opencode-free-tier gateway")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Modern replacement for on_event (deprecated in FastAPI 0.115+)."""
+    _startup()
+    try:
+        yield
+    finally:
+        _shutdown()
 
 
-def _prepare_vision(messages: list, alias: str) -> tuple[str, list[dict], int, bool]:
+app = FastAPI(title="opencode-free-tier gateway", lifespan=lifespan)
+
+
+def _prepare_vision(messages: list, alias: str) -> tuple[str, list[dict], int, bool, list]:
     """Extract images + build transcript for one request.
 
-    Returns (prompt, attach_files, omitted_total, images_attached).
+    Returns (prompt, attach_files, omitted_total, images_attached, compacted).
     attach_files is non-empty ONLY when images were saved AND this alias
     has a vision-ranked model; otherwise text-only with omission notes
     (legacy behavior). omitted_total counts over-limit + invalid + dropped.
+
+    Long agentic histories are compacted first (first message = goal,
+    plus a summary note, plus the last N turns) so late turns don't
+    balloon past upstream timeouts. Only images in the kept turns are
+    attached (old screenshots are dropped, not re-sent every turn).
+
+    The compacted list is returned so callers run other history analysis
+    (loop detection) on exactly what the model will see.
     """
-    files, over, invalid, status = extract_request_images(messages)
+    msgs, hist_omitted, hist_tools = compact_history(messages)
+    if hist_omitted:
+        log.info("history: compacted %d earlier turn(s) (tools there: %s)",
+                 hist_omitted, ",".join(hist_tools[:10]) or "none")
+    files, over, invalid, status = extract_request_images(msgs)
     dropped = 0
     vision_first = [m for m in vision_rank() if m in COMBO.get(alias, [])]
     attach = bool(files) and bool(vision_first)
@@ -1087,25 +1770,84 @@ def _prepare_vision(messages: list, alias: str) -> tuple[str, list[dict], int, b
         files = []
         log.info("vision: %d image(s) dropped (no vision model in alias '%s')",
                  dropped, alias)
-    prompt, _flat_omitted = flatten_messages(messages, image_status=status)
-    if over > 0:
-        prompt += f"\n\n[{over} image(s) omitted: over slam limit]"
-    return prompt, files, over + invalid + dropped, attach
+    # flatten_messages already emits a per-image marker for every omitted
+    # block, so no extra "[N images omitted]" line is appended here (it
+    # would double-count the same omissions for the model).
+    prompt, _flat_omitted = flatten_messages(msgs, image_status=status)
+    prompt = _cap_text(prompt)
+    # Best-effort disk hygiene: drop stale images from previous requests.
+    try:
+        cleanup_images()
+    except Exception:
+        pass
+    return prompt, files, over + invalid + dropped, attach, msgs
 
 
-@app.on_event("startup")
+HISTORY_KEEP_LAST = _int_env("GATEWAY_HISTORY_KEEP_LAST", 60)
+TRANSCRIPT_CHAR_CAP = _int_env("GATEWAY_TRANSCRIPT_CHAR_CAP", 400000)
+
+
+def _cap_text(s: str, limit: int = 0) -> str:
+    """Hard cap on transcript length (keep head + tail)."""
+    lim = limit or TRANSCRIPT_CHAR_CAP
+    if len(s) <= lim:
+        return s
+    # head must stay strictly smaller than lim, otherwise s[-(lim - head):]
+    # slices from the wrong end (a 0 or negative tail silently re-returns
+    # the whole string, blowing past the cap).
+    head = min(4000, max(0, lim // 2))
+    tail = max(0, lim - head)
+    if tail == 0:
+        return s[:lim]
+    return (s[:head] +
+            f"\n\n[... {len(s) - lim} chars of middle history omitted ...]\n\n" +
+            s[-tail:])
+
+
+def compact_history(messages: list) -> tuple[list, int, list]:
+    """Shrink long histories: [first (=goal), summary note, last N turns].
+
+    Returns (compacted, omitted_count, tool_names_in_omitted).
+    Short histories pass through untouched.
+    """
+    msgs = [m for m in messages or [] if isinstance(m, dict)]
+    if len(msgs) <= HISTORY_KEEP_LAST + 1:
+        return msgs, 0, []
+    omitted = msgs[1:-HISTORY_KEEP_LAST]
+    tools: list[str] = []
+    for m in omitted:
+        c = m.get("content", "")
+        if not isinstance(c, list):
+            continue
+        for b in c:
+            if (isinstance(b, dict) and b.get("type") == "tool_use"
+                    and isinstance(b.get("name"), str)
+                    and b["name"] not in tools):
+                tools.append(b["name"])
+    note = {"role": "user", "content": (
+        f"[{len(omitted)} earlier turns omitted for brevity. "
+        f"Tools used in omitted turns: {', '.join(tools[:10]) or 'none'}. "
+        f"Continue from the recent context below.]")}
+    return [msgs[0], note] + msgs[-HISTORY_KEEP_LAST:], len(omitted), tools
+
+
 def _startup():
     SESSION_DIR.mkdir(exist_ok=True)  # sandbox for model tool calls
     IMG_DIR.mkdir(exist_ok=True)  # v3: inbound images for vision routing
     log.info("combo aliases: %s", {k: len(v) for k, v in COMBO.items()})
     log.info("vision rank (%s): %s (max %d images, %.1f MB total)",
-             VISION_PROBE_DATE, [m.split("/", 1)[-1] for m in vision_rank()],
+             VISION_PROBE_DATE, vision_rank(),
              MAX_IMAGES, MAX_IMAGE_BYTES / 1024 / 1024)
+    log.info("limits: per-model %.0fs, per-request %.0fs, fail-cooldown %ds, img-ttl %.1fh",
+             UPSTREAM_TIMEOUT, TOTAL_BUDGET_S, FAIL_COOLDOWN_S, IMG_TTL_H)
+    try:
+        cleanup_images()
+    except Exception:
+        pass
     if not ensure_serve_running():
         log.error("opencode serve NOT available - /health will report it, chat will 502")
 
 
-@app.on_event("shutdown")
 def _shutdown():
     # Stop the serve instance WE spawned (if any); leave pre-existing ones alone.
     global _serve_proc
@@ -1130,7 +1872,7 @@ def health():
         "serve_detail": detail,
         "aliases": {k: len(v) for k, v in COMBO.items()},
         "tools_lockdown": DISABLE_TOOLS,
-        "vision_rank": [m.split("/", 1)[-1] for m in vision_rank()],
+        "vision_rank": vision_rank(),
         "vision_probe_date": VISION_PROBE_DATE,
         "max_images": MAX_IMAGES,
         "max_image_mb": round(MAX_IMAGE_BYTES / 1024 / 1024, 2),
@@ -1175,15 +1917,18 @@ async def anthropic_messages(request: Request):
         # No-tools path: text, or vision-first when images are attached.
         if has_tools and mode == "none":
             log.info("tool_choice none -> text-only (%d tools ignored)", len(tools))
-        prompt, img_files, _omitted, _attached = _prepare_vision(
+        prompt, img_files, _omitted, _attached, _msgs = _prepare_vision(
             body.get("messages", []), alias)
         if not prompt and not system:
             return anthropic_error(400, "empty prompt: provide messages or system")
+        deadline = time.time() + TOTAL_BUDGET_S
+        wd = resolve_session_dir(discover_cwd_paths(body.get("system")) or
+                                 discover_project_paths(body.get("messages", [])))
+        if PROJECT_LOG:
+            log.info("project: work_dir=%s (no-tools path)", wd)
         try:
-            with httpx.Client(timeout=UPSTREAM_TIMEOUT) as client:
-                text, used_model, usage = chat_with_fallback(
-                    client, alias, system, prompt or system,
-                    image_paths=img_files or None)
+            text, used_model, usage = await run_in_threadpool(
+                _chat_worker, alias, system, prompt or system, img_files, deadline, wd)
         except UpstreamError as e:
             return anthropic_error(502, f"upstream failed: {str(e)[:300]}")
         if stream:
@@ -1203,56 +1948,58 @@ async def anthropic_messages(request: Request):
         log.info("forced tool '%s' not in request tool list; treating as auto",
                  str(forced_name)[:80])
         mode, forced_name = "auto", None
-    transcript, img_files, images_omitted, images_attached = _prepare_vision(
+    transcript, img_files, images_omitted, images_attached, _kept = _prepare_vision(
         body.get("messages", []), alias)
     maybe_capture_request(body, tools)
+    # Loop detection runs on the FULL history, not the compacted one. The guard
+    # is a safety signal about the agent's behaviour, so dropping early turns
+    # would hide exactly the long explore-stall we need to catch (compaction
+    # keeps only the last HISTORY_KEEP_LAST messages).
+    loop_repeats, ro_streak, explore_stall = detect_tool_loop(body.get("messages", []))
+    if loop_repeats or ro_streak >= READ_ONLY_STREAK_THRESHOLD \
+            or explore_stall >= EXPLORE_STALL_THRESHOLD:
+        log.info("loop-guard: %d repeated call(s), read-only streak %d, explore-stall %d",
+                 len(loop_repeats), ro_streak, explore_stall)
+    all_msgs = body.get("messages", [])
+    # The folder the user ATTACHED in Claude Desktop comes from the system
+    # prompt, not the chat. It is authoritative: when present, it is the ONLY
+    # project path we state. Paths seen in the chat are usually stale context
+    # (a folder mentioned once, a sibling project, an old file) - feeding them
+    # to the model as peers is what made it wander into the wrong folder.
+    project_paths = discover_cwd_paths(body.get("system"))
+    if not project_paths:
+        for p in discover_project_paths(all_msgs):
+            if p not in project_paths:
+                project_paths.append(p)
+    done_reads, done_writes, _n_reads = summarize_progress(all_msgs)
+    # Where the model will actually run. This is what makes "I entered your
+    # folder" true: the serve session is created IN this directory, so the
+    # model's own tools (Read/Glob/Edit) operate on the user's project.
+    work_dir = resolve_session_dir(project_paths)
+    if PROJECT_LOG:
+        log.info("project: paths=%s work_dir=%s reads=%d",
+                 project_paths or "[]", work_dir, len(done_reads))
     decision_prompt = build_tool_decision_prompt(
         [t for t in tools if isinstance(t, dict)], tool_choice,
         transcript, system, images_omitted, body.get("max_tokens"),
-        images_attached=images_attached)
+        images_attached=images_attached,
+        loop_repeats=loop_repeats, read_only_streak=ro_streak,
+        explore_stall=explore_stall,
+        project_paths=project_paths,
+        done_reads=done_reads, done_writes=done_writes)
+    # Forced-tool retry is prepared here but executed inside the worker, so
+    # the "one whole request" deadline covers BOTH attempts.
+    retry_prompt = None
+    if mode == "forced" and forced_name in valid_names:
+        retry_prompt = (decision_prompt +
+                        f"\nCRITICAL: your previous reply did not call {forced_name}; "
+                        f"reply again with ONLY the JSON calling {forced_name}.")
+    deadline = time.time() + TOTAL_BUDGET_S
     try:
-        with httpx.Client(timeout=UPSTREAM_TIMEOUT) as client:
-            raw, used_model, usage = chat_with_fallback(
-                client, alias, "", decision_prompt,
-                image_paths=img_files or None)
-            data = _extract_decision_json(raw)
-            items = _validate_decision_items(data, valid_names) if data is not None else None
-            tool_names = [i["name"] for i in items if i["type"] == "tool_use"] if items else []
-            # Forced-tool second attempt with stronger forcing line.
-            if (mode == "forced" and forced_name in valid_names
-                    and forced_name not in tool_names):
-                log.info("forced tool '%s' absent in first decision; retrying with stronger force",
-                         forced_name[:80])
-                retry_prompt = (decision_prompt +
-                                f"\nCRITICAL: your previous reply did not call {forced_name}; "
-                                f"reply again with ONLY the JSON calling {forced_name}.")
-                try:
-                    raw2, used_model2, usage2 = chat_with_fallback(
-                        client, alias, "", retry_prompt,
-                        image_paths=img_files or None)
-                    raw, used_model, usage = raw2, used_model2, usage2
-                    data2 = _extract_decision_json(raw2)
-                    items2 = (_validate_decision_items(data2, valid_names)
-                              if data2 is not None else None)
-                    tool_names2 = [i["name"] for i in items2
-                                   if i["type"] == "tool_use"] if items2 else []
-                    if items2 is not None and forced_name in tool_names2:
-                        items, tool_names = items2, tool_names2
-                    else:
-                        log.info("forced tool '%s' still absent; text fallback (never 502)",
-                                 forced_name[:80])
-                        items = [{"type": "text", "text": raw2[:4000]}]
-                        tool_names = []
-                except UpstreamError as e2:
-                    # Retry failed but first attempt may still be usable.
-                    log.info("forced retry upstream failed (%s); using first attempt",
-                             str(e2)[:120])
-                    if items is None:
-                        raise
-            if items is None:
-                log.info("tool-decision parse failed, text fallback")
-                items = [{"type": "text", "text": raw[:4000]}]
-                tool_names = []
+        raw, used_model, usage, items = await run_in_threadpool(
+            _decision_worker, alias, decision_prompt, retry_prompt,
+            img_files, valid_names, forced_name if retry_prompt else None,
+            deadline, work_dir)
     except UpstreamError as e:
         # 502 only if ALL combo models failed.
         return anthropic_error(502, f"upstream failed: {str(e)[:300]}")
@@ -1297,17 +2044,20 @@ async def openai_chat(request: Request):
             system += c if isinstance(c, str) else extract_system(c)
         else:
             convo.append({"role": m.get("role", "user"), "content": m.get("content", "")})
-    prompt, img_files, _omitted, _attached = _prepare_vision(convo, alias)
+    prompt, img_files, _omitted, _attached, _msgs = _prepare_vision(convo, alias)
     if not prompt and not system:
         return JSONResponse({"error": {"message": "empty prompt"}}, status_code=400)
     stream = body.get("stream") is True
     chat_id = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
+    deadline = time.time() + TOTAL_BUDGET_S
+    wd = resolve_session_dir(discover_cwd_paths(system) or
+                             discover_project_paths(body.get("messages", [])))
+    if PROJECT_LOG:
+        log.info("project: work_dir=%s (openai path)", wd)
     try:
-        with httpx.Client(timeout=UPSTREAM_TIMEOUT) as client:
-            text, used_model, usage = chat_with_fallback(
-                client, alias, system, prompt or system,
-                image_paths=img_files or None)
+        text, used_model, usage = await run_in_threadpool(
+            _chat_worker, alias, system, prompt or system, img_files, deadline, wd)
     except UpstreamError as e:
         return JSONResponse({"error": {"message": f"upstream failed: {str(e)[:300]}"}}, status_code=502)
     if not stream:

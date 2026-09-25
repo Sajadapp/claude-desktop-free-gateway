@@ -13,7 +13,7 @@
 - 🖼️ Vision routing: screenshots forwarded as serve file parts (verified matrix inside)
 - 🧰 Tools bridge: model *decides* `text` / `tool_use`, Claude Desktop *executes* (stateless loop)
 - 📡 Anthropic `/v1/messages` + `/v1/models`, OpenAI `/v1/chat/completions`, SSE re-emit, `/health`
-- 🔒 Local-only: isolated `./sandbox/`, samples-only secrets (`.env` never committed)
+- 🔒 Local-only: runs in your opened project folder when detected (falls back to `./sandbox/`), samples-only secrets (`.env` never committed)
 
 ## Quickstart
 
@@ -40,8 +40,19 @@ and auto-spawns `opencode serve` on `:4097` if needed.
 - Gateway API key: paste the value of `GATEWAY_API_KEY` from `.env`
   (default `local-dev-key-12345` — change it to your own secret).
 - Model list (auto-discovered from `GET /v1/models`):
-  `claude-sonnet-4-5`, `claude-opus-4-5`, `claude-haiku-4-5`
-  (all three map to the SAME free-model combo in `combo.json`).
+  `claude-opus-4-5`, `claude-sonnet-4-5`, `claude-haiku-4-5`.
+  Each alias maps to a SEPARATE combo in `combo.json` so you can switch
+  manually from the Claude Desktop model picker:
+
+  | picker name | backend (in order) |
+  |---|---|
+  | `claude-opus-4-5` | Go only: `opencode-go/muse-spark-1.3-contributor` |
+  | `claude-sonnet-4-5` | free combo (mimo-v2.6 first, no Go) |
+  | `claude-haiku-4-5` | free combo (same as sonnet, no Go) |
+
+  Opus never silently falls back to free models (and free aliases never
+  touch Go): if the backend hangs/errors past the per-model timeout
+  (150s), you get a clear `502` and can switch alias yourself.
 
 ## Reorder combo
 
@@ -57,6 +68,16 @@ Restart the gateway after editing.
 - `502 upstream failed` / `429`: a combo model hit rate-limit or errored;
   the gateway already tried the next ones. Check `GET /health`
   (`serve_reachable` must be `true`) and try again later.
+- Slow image turns on free aliases: free vision models go down in waves
+  (timeout/500). The gateway cools a failed model down for 10 minutes
+  (`GATEWAY_FAIL_COOLDOWN_S`, `cooldown:` lines in the log), so repeat
+  turns skip the dead ones and go straight to the working model.
+  For image/agentic work, prefer `claude-opus-4-5` (Go, ~10s vision).
+- Long agentic tasks: history is compacted per request (original goal +
+  summary note + last 60 turns, `GATEWAY_HISTORY_KEEP_LAST`; transcript
+  capped at ~400k chars, `GATEWAY_TRANSCRIPT_CHAR_CAP`; only recent
+  screenshots re-attached). Watch for `history: compacted ...` lines —
+  if a late turn still times out, the task needs smaller steps.
 - Serve `401 auth-rejected`: `OPENCODE_SERVE_USERNAME/PASSWORD` in `.env`
   don't match the running serve instance. Stop the stray
   `opencode serve` (or fix `.env`) and restart the gateway.
@@ -70,8 +91,11 @@ with a placeholder note. `thinking` blocks are not forwarded/returned.
 Streaming endpoints exist but re-emit the full upstream reply as SSE
 (upstream `serve` call itself is non-streaming).
 Model tool calls (bash/read/...) stay ENABLED (disabling them breaks free
-models) but sessions run isolated in `./sandbox/` — keep no secrets there.
-Stop the gateway with Ctrl+C (graceful: also stops its spawned serve).
+models). Sessions run in your opened project folder when the gateway
+detects it (otherwise isolated in `./sandbox/`) — keep no secrets in
+either place. The model genuinely reads/writes your project there, so
+supervise every tool call. Stop the gateway with Ctrl+C (graceful: also
+stops its spawned serve).
 
 ## FAQ: Cowork / computer-use tools (v2.0-beta)
 
@@ -84,6 +108,10 @@ full history (`tool_use` + `tool_result`), stateless on the gateway side.
 File/bash-style tools that the client executes work; `tool_choice`
 `auto` / `any` / `none` / forced-tool are honored (forced retries once,
 then falls back to text, never 502 for a missed force).
+Loop guard: the gateway scans each request's history — an exact tool call
+repeated 3+ times, or 8+ read-only calls in a row, triggers a
+LOOP/PROGRESS WARNING in the decision prompt (see `loop-guard:` log lines)
+to push the model out of explore-forever stalls.
 
 What does NOT work well: computer-use coordinate/grounding tasks are
 unreliable on text-only fallback models — but when screenshots are

@@ -11,3 +11,6 @@ __pycache__/
 sandbox/
 captures/
 *.log
+
+# Local dev/test scripts (may contain private machine paths) - never publish
+test_*.py
