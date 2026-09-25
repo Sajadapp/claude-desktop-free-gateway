@@ -1,3 +1,28 @@
+# claude-desktop-free-gateway
+
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688.svg)](https://fastapi.tiangolo.com/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Sajadapp/claude-desktop-free-gateway/pulls)
+
+> Free-tier gateway: use **Claude Desktop** with **free OpenCode models** via an Anthropic-compatible API — with vision + tools bridge.
+
+**Why this?** Claude Desktop expects the Anthropic Messages API. This lightweight local gateway translates it to a local `opencode serve` instance (the only path that can use OpenCode's free tier), with automatic model fallback, screenshot/vision routing, and a Cowork/tools decision bridge.
+
+- 🔄 Ordered fallback across free models (`combo.json`)
+- 🖼️ Vision routing: screenshots forwarded as serve file parts (verified matrix inside)
+- 🧰 Tools bridge: model *decides* `text` / `tool_use`, Claude Desktop *executes* (stateless loop)
+- 📡 Anthropic `/v1/messages` + `/v1/models`, OpenAI `/v1/chat/completions`, SSE re-emit, `/health`
+- 🔒 Local-only: isolated `./sandbox/`, samples-only secrets (`.env` never committed)
+
+## Quickstart
+
+1. `cp .env.example .env` → set `GATEWAY_API_KEY` + `OPENCODE_SERVE_PASSWORD`
+2. Double-click `run_gateway.bat` (or `uvicorn gateway:app --host 127.0.0.1 --port 3457`)
+3. Claude Desktop → Gateway base URL `http://127.0.0.1:3457`, auth `bearer`, key = `GATEWAY_API_KEY`
+
+---
+
 # Claude Desktop Gateway — راهنمای کوتاه / Short guide
 
 ## Start / اجرا
