@@ -21,20 +21,19 @@
 2. Double-click `run_gateway.bat` (or `uvicorn gateway:app --host 127.0.0.1 --port 3457`)
 3. Claude Desktop → Gateway base URL `http://127.0.0.1:3457`, auth `bearer`, key = `GATEWAY_API_KEY`
 
+> Persian guide: see [README.fa.md](README.fa.md).
+
 ---
 
-# Claude Desktop Gateway — راهنمای کوتاه / Short guide
+## Short guide
 
-## Start / اجرا
+## Start
 
 Double-click `run_gateway.bat` (or run it in a terminal).
 It activates `.venv`, starts the gateway on `http://127.0.0.1:3457`,
 and auto-spawns `opencode serve` on `:4097` if needed.
 
-دابل‌کلیک روی `run_gateway.bat`. گیت‌وی روی `http://127.0.0.1:3457`
-بالا می‌آید و اگر `opencode serve` روی `:4097` نباشد خودش اجرایش می‌کند.
-
-## Claude Desktop settings / تنظیمات
+## Claude Desktop settings
 
 - Gateway base URL: `http://127.0.0.1:3457`
 - Auth scheme: `bearer`
@@ -44,14 +43,14 @@ and auto-spawns `opencode serve` on `:4097` if needed.
   `claude-sonnet-4-5`, `claude-opus-4-5`, `claude-haiku-4-5`
   (all three map to the SAME free-model combo in `combo.json`).
 
-## Reorder combo / ترتیب مدل‌ها
+## Reorder combo
 
 Edit `combo.json`: each alias maps to an ordered list.
 The gateway tries them in order and falls back on error / rate-limit /
 empty reply. Put chat-compatible models first, responses-only ones last.
 Restart the gateway after editing.
 
-## Troubleshooting / رفع اشکال
+## Troubleshooting
 
 - `401 invalid API key`: the key in Claude Desktop ≠ `GATEWAY_API_KEY`
   in `.env`. Copy it exactly.
@@ -64,7 +63,7 @@ Restart the gateway after editing.
 - NOTE: requests are slowish (free models via serve: tens of seconds) and
   each request burns ~20k input tokens of opencode system prompt.
 
-## Limits (v1) / محدودیت‌ها
+## Limits (v1)
 
 Text chat only. `tools`/computer-use -> clear `400`. Images -> replaced
 with a placeholder note. `thinking` blocks are not forwarded/returned.
