@@ -1,0 +1,13 @@
+# Secrets — never commit real keys (samples only in .env.example)
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime / local data
+sandbox/
+captures/
+*.log
